@@ -1,0 +1,34 @@
+# Secrets / config
+.env
+*.env
+!.env.example
+
+# TLS material
+nginx/certs/*.crt
+nginx/certs/*.key
+nginx/certs/*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Build / logs
+*.log
+smoke-creds.json
+
+# OS / editor / local agent config
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/
+
+# Local model cache (mounted as a Docker volume in prod)
+.deepface/
+
+testdata/

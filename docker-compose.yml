@@ -1,0 +1,159 @@
+# Single-host deployment — Xeon Silver 4214R, 24 vCPU, 128 GB RAM, Ubuntu 24.04.
+# mem_limit keeps each container from starving the others; total allocation ~30 GB,
+# leaving 98 GB free for OS and future services.
+
+services:
+  api:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    image: face-compare-api:1.0.0
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # 20 workers on 24 vCPU — reserves 4 cores for OS/nginx/monitoring.
+      # Each worker holds one Facenet512 model (~800 MB). 20 × 800 MB ≈ 16 GB.
+      GUNICORN_WORKERS: "20"
+      PROMETHEUS_MULTIPROC_DIR: "/tmp/prometheus_multiproc"
+      # One inference at a time per worker — closes the OpenCV thread-safety race.
+      # Parallelism comes from the worker count, not from threading within a worker.
+      INFERENCE_CONCURRENCY: "1"
+      MAX_CONCURRENT_REQUESTS: "0"
+      MAX_IMAGE_DIM: "1024"
+      # Shared SQLite DB (usage logs + API keys) — written by api, read by admin.
+      DB_PATH: "/data/facecomparedrift.db"
+    volumes:
+      - deepface_weights:/home/app/.deepface
+      - facecomparedrift_data:/data
+    # 20 workers × ~800 MB + headroom = 25 GB cap.
+    mem_limit: 25g
+    mem_reservation: 18g
+    expose:
+      - "8000"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 300s
+      retries: 3
+    networks:
+      - facenet
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    mem_limit: 256m
+    networks:
+      - facenet
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    mem_limit: 1g
+    expose:
+      - "9090"
+    networks:
+      - facenet
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    env_file:
+      - .env
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    mem_limit: 512m
+    ports:
+      - "3001:3000"
+    networks:
+      - facenet
+
+  # Admin panel — API key management + usage records by time window.
+  # Access at http://<server>:8080 (internal only; do not expose to internet).
+  # Credentials: ADMIN_USER / ADMIN_PASSWORD from .env
+  admin:
+    build:
+      context: ./admin
+      dockerfile: Dockerfile
+    image: facecomparedrift-admin:1.0.0
+    restart: unless-stopped
+    depends_on:
+      - api
+    env_file:
+      - .env
+    environment:
+      DB_PATH: "/data/facecomparedrift.db"
+      ADMIN_USER: "${ADMIN_USER:-admin}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
+    volumes:
+      - facecomparedrift_data:/data
+    ports:
+      - "8080:8080"
+    mem_limit: 256m
+    networks:
+      - facenet
+
+  # Stakeholder demo UI (Streamlit). Opt-in: not started by default.
+  #   docker compose --profile demo up -d api demo
+  # then open http://localhost:8501
+  demo:
+    build:
+      context: ./demo
+      dockerfile: Dockerfile
+    image: face-compare-demo:1.0.0
+    profiles: ["demo"]
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      API_URL: "http://api:8000/facepp/v3/compare"
+      # Credentials come from .env (never hard-code real keys here).
+      API_KEY: "${DEMO_API_KEY:-}"
+      API_SECRET: "${DEMO_API_SECRET:-}"
+      SAMPLE_DIR: "/app/samples"
+      SAMPLE_A: "face1.jpg"
+      SAMPLE_B: "face2.jpg"
+    volumes:
+      - ./testdata:/app/samples:ro
+      - ./docs:/app/report:ro
+    ports:
+      - "8501:8501"
+    mem_limit: 512m
+    networks:
+      - facenet
+
+volumes:
+  deepface_weights:
+  prometheus_data:
+  grafana_data:
+  facecomparedrift_data:
+
+networks:
+  facenet:
+    driver: bridge
