@@ -1,0 +1,204 @@
+"""API contract tests for the Face++-compatible endpoint (PRD §8).
+
+The recognition engine is mocked (see conftest.fake_embeddings), so these run
+without TensorFlow. They assert the wire contract, auth, error shapes, and that
+no employee/identity parameter is ever required.
+"""
+import base64
+
+import numpy as np
+import pytest
+from fastapi.testclient import TestClient
+
+from app import errors
+from app.main import app
+
+
+@pytest.fixture
+def client():
+    with TestClient(app) as c:
+        yield c
+
+
+def _auth():
+    """Credentials as query params — matches Face++ convention (?api_key=...&api_secret=...)."""
+    return "?api_key=key-a&api_secret=secret-a"
+
+
+def test_large_multipart_image_accepted(client, fake_embeddings):
+    """A >1 MB image part must be accepted, not rejected by the multipart parser.
+
+    Regression guard: Starlette's default 1 MB per-part cap made every phone
+    photo over 1 MB fail with a 500 (MultiPartException) before downscaling
+    could run — a real source of attendance retries. Startup raises the cap to
+    MAX_IMAGE_BYTES; this proves a 1 MB+ upload now goes through.
+    """
+    import io
+
+    from PIL import Image
+
+    fake_embeddings(np.ones(512), np.ones(512))
+    # Random noise compresses poorly -> a comfortably >1 MB JPEG.
+    arr = np.random.randint(0, 256, (2000, 2000, 3), dtype=np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, format="JPEG", quality=95)
+    data = buf.getvalue()
+    assert len(data) > 1024 * 1024  # exceeds the old 1 MB part limit
+
+    r = client.post(
+        "/facepp/v3/compare" + _auth(),
+        files={
+            "image_file1": ("a.jpg", data, "image/jpeg"),
+            "image_file2": ("b.jpg", data, "image/jpeg"),
+        },
+    )
+    assert r.status_code == 200
+    assert "confidence" in r.json()
+
+
+def test_health(client):
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+
+
+def test_compare_success_shape(client, jpeg_bytes, fake_embeddings):
+    fake_embeddings(np.ones(512), np.ones(512))  # identical -> high confidence
+    b64 = base64.b64encode(jpeg_bytes).decode()
+    r = client.post(
+        "/facepp/v3/compare" + _auth(),
+        data={"image_base64_1": b64, "image_base64_2": b64},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"confidence", "thresholds", "request_id", "time_used"}
+    assert body["confidence"] == 100.0  # cos sim 1.0 * scale 100
+    assert set(body["thresholds"]) == {"1e-3", "1e-4", "1e-5"}
+    assert isinstance(body["time_used"], int)
+
+
+def test_v3_alias_works(client, jpeg_bytes, fake_embeddings):
+    fake_embeddings(np.ones(512), np.ones(512))
+    b64 = base64.b64encode(jpeg_bytes).decode()
+    r = client.post(
+        "/v3/compare" + _auth(),
+        data={"image_base64_1": b64, "image_base64_2": b64},
+    )
+    assert r.status_code == 200
+
+
+def test_auth_failure(client, jpeg_bytes):
+    b64 = base64.b64encode(jpeg_bytes).decode()
+    r = client.post(
+        "/facepp/v3/compare?api_key=key-a&api_secret=wrong",
+        data={"image_base64_1": b64, "image_base64_2": b64},
+    )
+    assert r.status_code == 401
+    assert r.json()["error_message"] == errors.AUTHENTICATION_ERROR
+
+
+def test_missing_image_argument(client, jpeg_bytes, fake_embeddings):
+    fake_embeddings(np.ones(512), np.ones(512))
+    b64 = base64.b64encode(jpeg_bytes).decode()
+    r = client.post(
+        "/facepp/v3/compare" + _auth(),
+        data={"image_base64_1": b64},  # image2 missing
+    )
+    assert r.status_code == 400
+    assert r.json()["error_message"] == errors.MISSING_ARGUMENTS
+
+
+def test_invalid_image(client, fake_embeddings):
+    fake_embeddings(np.ones(512), np.ones(512))
+    bad = base64.b64encode(b"not an image").decode()
+    r = client.post(
+        "/facepp/v3/compare" + _auth(),
+        data={"image_base64_1": bad, "image_base64_2": bad},
+    )
+    assert r.status_code == 400
+    assert r.json()["error_message"] == errors.INVALID_IMAGE
+
+
+def test_no_face_detected(client, jpeg_bytes, monkeypatch):
+    import app.compare as compare
+
+    def raise_no_face(img, settings, slot_name):
+        raise errors.CompareError(errors.NO_FACE_DETECTED)
+
+    monkeypatch.setattr(compare, "represent", raise_no_face)
+    b64 = base64.b64encode(jpeg_bytes).decode()
+    r = client.post(
+        "/facepp/v3/compare" + _auth(),
+        data={"image_base64_1": b64, "image_base64_2": b64},
+    )
+    assert r.status_code == 400
+    assert r.json()["error_message"] == errors.NO_FACE_DETECTED
+
+
+def test_file_upload_takes_precedence_over_base64(client, jpeg_bytes, fake_embeddings):
+    # Supply both file and a bogus base64; file precedence means success.
+    fake_embeddings(np.ones(512), np.ones(512))
+    r = client.post(
+        "/facepp/v3/compare" + _auth(),
+        data={"image_base64_1": "garbage", "image_base64_2": "garbage"},
+        files={
+            "image_file1": ("a.jpg", jpeg_bytes, "image/jpeg"),
+            "image_file2": ("b.jpg", jpeg_bytes, "image/jpeg"),
+        },
+    )
+    assert r.status_code == 200
+
+
+def test_metrics_endpoint(client):
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    assert "facecompare_requests_total" in r.text
+
+
+def test_no_identity_param_accepted(client, jpeg_bytes, fake_embeddings):
+    # An employee_id param must be silently ignored, never required or used.
+    fake_embeddings(np.ones(512), np.ones(512))
+    b64 = base64.b64encode(jpeg_bytes).decode()
+    r = client.post(
+        "/facepp/v3/compare" + _auth(),
+        data={"image_base64_1": b64, "image_base64_2": b64, "employee_id": "E123"},
+    )
+    assert r.status_code == 200
+    assert "employee_id" not in r.json()
+
+
+# --- Concurrency control (burst hardening) ----------------------------------
+def test_inference_serialized_per_worker(client):
+    # A CapacityLimiter enforces one compare at a time per worker by default,
+    # closing the OpenCV detector thread-safety race seen under burst.
+    assert app.state.inference_limiter.total_tokens == 1
+
+
+def test_concurrency_limit_exceeded_returns_busy(client, jpeg_bytes, fake_embeddings):
+    # When the worker is already saturated, excess load is shed fast as a
+    # Face++-shaped CONCURRENCY_LIMIT_EXCEEDED (HTTP 403) instead of queueing.
+    fake_embeddings(np.ones(512), np.ones(512))
+    app.state.max_inflight = 2
+    app.state.inflight = 2  # simulate a fully-saturated worker
+    try:
+        b64 = base64.b64encode(jpeg_bytes).decode()
+        r = client.post(
+            "/facepp/v3/compare" + _auth(),
+            data={"image_base64_1": b64, "image_base64_2": b64},
+        )
+        assert r.status_code == 403
+        assert r.json()["error_message"] == errors.CONCURRENCY_LIMIT_EXCEEDED
+    finally:
+        app.state.inflight = 0
+
+
+def test_inflight_counter_resets_after_request(client, jpeg_bytes, fake_embeddings):
+    # A completed request must release its in-flight slot, even on the happy path.
+    fake_embeddings(np.ones(512), np.ones(512))
+    b64 = base64.b64encode(jpeg_bytes).decode()
+    r = client.post(
+        "/facepp/v3/compare" + _auth(),
+        data={"image_base64_1": b64, "image_base64_2": b64},
+    )
+    assert r.status_code == 200
+    assert app.state.inflight == 0
