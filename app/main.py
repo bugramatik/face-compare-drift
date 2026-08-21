@@ -25,7 +25,7 @@ from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.formparsers import MultiPartException, MultiPartParser
 
-from . import db, errors, metrics
+from . import db, drift, errors, metrics
 from .compare import run_comparison, thresholds
 from .config import get_settings
 from .face_engine import warmup
@@ -50,6 +50,7 @@ async def lifespan(app: FastAPI):
     # this class attribute.
     MultiPartParser.max_part_size = settings.max_image_bytes
     await db.init_db()
+    await drift.init_baseline_table()
     if not await db.count_active_keys():
         raise RuntimeError(
             "No active API keys found. Set API_CREDENTIALS env var (inline JSON) "
@@ -259,6 +260,17 @@ async def facepp_compare(request: Request) -> Response:
 @app.post("/v3/compare")
 async def compare_alias(request: Request) -> Response:
     return await _compare(request, "/v3/compare")
+
+
+@app.get("/drift/report")
+async def drift_report() -> JSONResponse:
+    """Compare recent confidence scores with the frozen baseline."""
+    settings = get_settings()
+    report = await drift.build_report(
+        window=settings.drift_window,
+        threshold=settings.drift_psi_threshold,
+    )
+    return JSONResponse(content=report)
 
 
 @app.get("/health")

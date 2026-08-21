@@ -136,6 +136,25 @@ async def log_request(
         await db.commit()
 
 
+async def recent_success_scores(limit: int) -> list[float]:
+    """Return the most recent successful confidence scores, newest first.
+
+    Used by the drift check so it does not open its own connection. Rows with a
+    NULL confidence (errors, or a compare that never scored) are skipped.
+    """
+    if limit <= 0:
+        return []
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT confidence FROM request_logs "
+            "WHERE status_code = 200 AND confidence IS NOT NULL "
+            "ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cur.fetchall()
+    return [float(r[0]) for r in rows]
+
+
 async def save_failed_capture(
     request_id: str,
     confidence: Optional[float],
